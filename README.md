@@ -43,6 +43,38 @@ python crime_risk_pipeline.py \
   --use_temporal_lag
 ```
 
+## Spatio-Temporal Graph + ZIP + Fairness Extension
+
+The pipeline now includes an optional graph-based model that:
+- Represents neighborhoods as graph nodes.
+- Builds graph edges from geographic proximity (`--adjacency_mode proximity`) or a road-connectivity edge list (`--adjacency_mode road`, `--road_edges_csv`).
+- Applies a temporal gated convolution layer over monthly crime sequences.
+- Applies a spatial graph convolution layer to model risk spillover to adjacent neighborhoods.
+- Optimizes a Zero-Inflated Poisson objective with an additional fairness penalty to reduce disparate impact across demographic clusters.
+
+Example:
+
+```bash
+python crime_risk_pipeline.py \
+  --crime_csv data/crime.csv \
+  --bars_csv data/bars.csv \
+  --streetlights_csv data/streetlights.csv \
+  --vacant_csv data/vacant_buildings.csv \
+  --census_path data/census.geojson \
+  --output_dir outputs \
+  --use_stzi_fair_model \
+  --adjacency_mode hybrid \
+  --road_edges_csv data/road_edges.csv \
+  --k_neighbors 6 \
+  --time_window 12 \
+  --fairness_col median_income \
+  --fairness_weight 0.1
+```
+
+Road edge CSV schema (for `road`/`hybrid`):
+- `source_grid_id`
+- `target_grid_id`
+
 ### What it does
 1. Aggregates crimes per spatial unit.
 2. Computes `crime_rate` per 1,000 population.
@@ -60,6 +92,11 @@ python crime_risk_pipeline.py \
    - `outputs/best_model.joblib`
    - `outputs/metadata.json`
    - map and feature-importance plots
+8. Optionally (when `--use_stzi_fair_model` is enabled), also saves:
+   - `outputs/stzi_fair_model.joblib`
+   - `outputs/stzi_fair_metrics.csv`
+   - `outputs/adjacency_matrix.npy`
+   - `outputs/temporal_sequences.npy`
 
 ## Optional Streamlit App
 
