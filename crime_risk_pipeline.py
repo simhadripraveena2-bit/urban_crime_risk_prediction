@@ -41,7 +41,7 @@ except ImportError as exc:
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import LinearRegression, PoissonRegressor
+from sklearn.linear_model import LinearRegression, LogisticRegression, PoissonRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import Pipeline
@@ -187,6 +187,178 @@ def build_spatial_groups(units_gdf: gpd.GeoDataFrame, n_bins: int = 5) -> np.nda
     y_bin = pd.qcut(y, q=min(n_bins, len(np.unique(y))), duplicates="drop", labels=False)
     groups = (pd.Series(x_bin).astype(str) + "_" + pd.Series(y_bin).astype(str)).to_numpy()
     return groups
+
+
+def build_adjacency_matrix(
+    units_gdf: gpd.GeoDataFrame,
+    mode: str = "proximity",
+    k_neighbors: int = 6,
+    road_edges_path: Path | None = None,
+) -> np.ndarray:
+    """Build node adjacency from geographic proximity and optional road edges."""
+    centroids = units_gdf.to_crs("EPSG:3857").centroid
+    coords = np.c_[centroids.x.values, centroids.y.values]
+    n_nodes = len(coords)
+    adjacency = np.zeros((n_nodes, n_nodes), dtype=float)
+
+    if n_nodes <= 1:
+        return adjacency
+
+    if mode in {"proximity", "hybrid"}:
+        dist = np.sqrt(((coords[:, None, :] - coords[None, :, :]) ** 2).sum(axis=2))
+        np.fill_diagonal(dist, np.inf)
+        k_eff = max(1, min(k_neighbors, n_nodes - 1))
+        for idx in range(n_nodes):
+            neighbors = np.argpartition(dist[idx], k_eff)[:k_eff]
+            adjacency[idx, neighbors] = 1.0
+            adjacency[neighbors, idx] = 1.0
+
+    if mode in {"road", "hybrid"} and road_edges_path is not None and road_edges_path.exists():
+        road_df = pd.read_csv(road_edges_path)
+        needed = {"source_grid_id", "target_grid_id"}
+        missing = needed - set(road_df.columns)
+        if missing:
+            raise ValueError(f"Road edge CSV missing required columns: {sorted(missing)}")
+        index_by_grid = pd.Series(units_gdf.index.values, index=units_gdf["grid_id"]).to_dict()
+        for row in road_df.itertuples(index=False):
+            src = index_by_grid.get(getattr(row, "source_grid_id"))
+            dst = index_by_grid.get(getattr(row, "target_grid_id"))
+            if src is not None and dst is not None and src != dst:
+                adjacency[src, dst] = 1.0
+                adjacency[dst, src] = 1.0
+
+    np.fill_diagonal(adjacency, 1.0)
+    return adjacency
+
+
+def _normalize_adjacency(adjacency: np.ndarray) -> np.ndarray:
+    deg = adjacency.sum(axis=1)
+    deg = np.where(deg == 0, 1.0, deg)
+    inv_sqrt = np.diag(1.0 / np.sqrt(deg))
+    return inv_sqrt @ adjacency @ inv_sqrt
+
+
+def temporal_gated_conv_layer(sequence: np.ndarray) -> np.ndarray:
+    """Simple temporal gated layer over historical monthly crime counts."""
+    # sequence shape: [n_nodes, time_window, in_dim]
+    if sequence.ndim != 3:
+        raise ValueError("sequence must have shape [n_nodes, time_window, in_dim]")
+    in_dim = sequence.shape[-1]
+    gate_w = np.ones((in_dim, in_dim), dtype=float) * 0.25
+    cand_w = np.eye(in_dim, dtype=float)
+    gate = 1.0 / (1.0 + np.exp(-(sequence @ gate_w)))
+    candidate = np.tanh(sequence @ cand_w)
+    gated = gate * candidate
+    return gated.mean(axis=1)
+
+
+def spatial_graph_conv_layer(node_features: np.ndarray, adjacency: np.ndarray) -> np.ndarray:
+    """One-hop graph convolution for neighborhood spillover effects."""
+    if node_features.ndim != 2:
+        raise ValueError("node_features must have shape [n_nodes, hidden_dim]")
+    adj_norm = _normalize_adjacency(adjacency)
+    return adj_norm @ node_features
+
+
+def zip_fairness_loss(
+    y_true: np.ndarray,
+    lam: np.ndarray,
+    zero_prob: np.ndarray,
+    cluster_ids: np.ndarray,
+    fairness_weight: float,
+) -> float:
+    """Zero-inflated Poisson NLL + disparate impact penalty."""
+    eps = 1e-8
+    y = np.asarray(y_true, dtype=float)
+    lam = np.clip(np.asarray(lam, dtype=float), eps, None)
+    pi = np.clip(np.asarray(zero_prob, dtype=float), eps, 1.0 - eps)
+
+    is_zero = (y == 0).astype(float)
+    poisson_zero = np.exp(-lam)
+    ll_zero = np.log(pi + (1.0 - pi) * poisson_zero + eps)
+    ll_pos = np.log(1.0 - pi + eps) + y * np.log(lam + eps) - lam
+    zip_nll = -(is_zero * ll_zero + (1.0 - is_zero) * ll_pos).mean()
+
+    expected_counts = (1.0 - pi) * lam
+    global_mean = expected_counts.mean()
+    disparity = 0.0
+    for grp in np.unique(cluster_ids):
+        grp_mean = expected_counts[cluster_ids == grp].mean()
+        disparity += (grp_mean - global_mean) ** 2
+    fairness_penalty = disparity / max(len(np.unique(cluster_ids)), 1)
+    return float(zip_nll + fairness_weight * fairness_penalty)
+
+
+class STZIFairRegressor:
+    """Spatio-temporal regressor with gated temporal conv, graph conv, ZIP loss, and fairness penalty."""
+
+    def __init__(self, fairness_weight: float = 0.1):
+        self.fairness_weight = fairness_weight
+
+    def fit(self, sequence: np.ndarray, adjacency: np.ndarray, y: np.ndarray, cluster_ids: np.ndarray) -> "STZIFairRegressor":
+        temporal = temporal_gated_conv_layer(sequence)
+        self.graph_features_ = spatial_graph_conv_layer(temporal, adjacency)
+
+        target_log = np.log1p(np.asarray(y, dtype=float))
+        self.rate_coef_, *_ = np.linalg.lstsq(self.graph_features_, target_log, rcond=None)
+
+        zero_target = (np.asarray(y) == 0).astype(int)
+        clf = LogisticRegression(max_iter=300, random_state=RANDOM_STATE)
+        clf.fit(self.graph_features_, zero_target)
+        self.zero_clf_ = clf
+
+        self.loss_ = zip_fairness_loss(
+            y_true=y,
+            lam=self.predict_lambda(sequence, adjacency),
+            zero_prob=self.predict_zero_probability(sequence, adjacency),
+            cluster_ids=cluster_ids,
+            fairness_weight=self.fairness_weight,
+        )
+        return self
+
+    def _transform(self, sequence: np.ndarray, adjacency: np.ndarray) -> np.ndarray:
+        temporal = temporal_gated_conv_layer(sequence)
+        return spatial_graph_conv_layer(temporal, adjacency)
+
+    def predict_lambda(self, sequence: np.ndarray, adjacency: np.ndarray) -> np.ndarray:
+        feats = self._transform(sequence, adjacency)
+        return np.expm1(np.clip(feats @ self.rate_coef_, -20, 20)) + 1e-6
+
+    def predict_zero_probability(self, sequence: np.ndarray, adjacency: np.ndarray) -> np.ndarray:
+        feats = self._transform(sequence, adjacency)
+        return self.zero_clf_.predict_proba(feats)[:, 1]
+
+    def predict(self, sequence: np.ndarray, adjacency: np.ndarray) -> np.ndarray:
+        lam = self.predict_lambda(sequence, adjacency)
+        pi = self.predict_zero_probability(sequence, adjacency)
+        return (1.0 - pi) * lam
+
+
+def build_temporal_sequences(
+    crime_gdf: gpd.GeoDataFrame,
+    units_gdf: gpd.GeoDataFrame,
+    time_window: int,
+) -> np.ndarray:
+    """Build monthly crime-count sequences per grid cell."""
+    joined = gpd.sjoin(crime_gdf, units_gdf[["grid_id", "geometry"]], how="left", predicate="within")
+    joined = joined.dropna(subset=["grid_id"]).copy()
+    joined["year_month"] = joined["date"].dt.to_period("M").astype(str)
+    monthly = joined.groupby(["grid_id", "year_month"]).size().rename("monthly_count").reset_index()
+    pivot = (
+        monthly.pivot(index="grid_id", columns="year_month", values="monthly_count")
+        .reindex(units_gdf["grid_id"])
+        .fillna(0.0)
+    )
+    if pivot.shape[1] == 0:
+        return np.zeros((len(units_gdf), time_window, 1), dtype=float)
+
+    arr = pivot.to_numpy(dtype=float)
+    if arr.shape[1] < time_window:
+        pad = np.zeros((arr.shape[0], time_window - arr.shape[1]), dtype=float)
+        arr = np.concatenate([pad, arr], axis=1)
+    else:
+        arr = arr[:, -time_window:]
+    return arr[:, :, None]
 
 
 # --------------------------
@@ -348,6 +520,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target", type=str, default="crime_rate", choices=["crime_rate", "crime_count"])
     parser.add_argument("--output_dir", type=Path, default=Path("outputs"))
     parser.add_argument("--use_temporal_lag", action="store_true")
+    parser.add_argument("--use_stzi_fair_model", action="store_true")
+    parser.add_argument("--adjacency_mode", type=str, default="proximity", choices=["proximity", "road", "hybrid"])
+    parser.add_argument("--road_edges_csv", type=Path, default=None)
+    parser.add_argument("--k_neighbors", type=int, default=6)
+    parser.add_argument("--time_window", type=int, default=12)
+    parser.add_argument("--fairness_col", type=str, default="median_income")
+    parser.add_argument("--fairness_weight", type=float, default=0.1)
     parser.add_argument("--n_splits", type=int, default=5)
     return parser.parse_args()
 
@@ -398,6 +577,51 @@ def main() -> None:
     cv_results.to_csv(args.output_dir / "cv_results.csv", index=False)
     modeling_df.to_file(args.output_dir / "feature_table.geojson", driver="GeoJSON")
 
+    stzi_metadata: Dict[str, object] = {}
+    if args.use_stzi_fair_model:
+        print("Training spatio-temporal ZIP+fairness model...")
+        adjacency = build_adjacency_matrix(
+            units_gdf=modeling_df,
+            mode=args.adjacency_mode,
+            k_neighbors=args.k_neighbors,
+            road_edges_path=args.road_edges_csv,
+        )
+        sequences = build_temporal_sequences(crime_gdf=crime_gdf, units_gdf=modeling_df, time_window=args.time_window)
+
+        fairness_values = modeling_df[args.fairness_col]
+        fairness_values = fairness_values.fillna(fairness_values.median())
+        cluster_ids = pd.qcut(fairness_values, q=4, labels=False, duplicates="drop").to_numpy()
+
+        stzi_model = STZIFairRegressor(fairness_weight=args.fairness_weight)
+        stzi_model.fit(
+            sequence=sequences,
+            adjacency=adjacency,
+            y=modeling_df["crime_count"].to_numpy(dtype=float),
+            cluster_ids=cluster_ids,
+        )
+        stzi_pred = stzi_model.predict(sequences, adjacency)
+        stzi_metrics = {
+            "model": "stzi_fair",
+            "rmse": float(np.sqrt(mean_squared_error(modeling_df["crime_count"], stzi_pred))),
+            "mae": float(mean_absolute_error(modeling_df["crime_count"], stzi_pred)),
+            "r2": float(r2_score(modeling_df["crime_count"], stzi_pred)),
+            "zip_fair_loss": float(stzi_model.loss_),
+        }
+        pd.DataFrame([stzi_metrics]).to_csv(args.output_dir / "stzi_fair_metrics.csv", index=False)
+        np.save(args.output_dir / "adjacency_matrix.npy", adjacency)
+        np.save(args.output_dir / "temporal_sequences.npy", sequences)
+        joblib.dump(stzi_model, args.output_dir / "stzi_fair_model.joblib")
+        stzi_metadata = {
+            "enabled": True,
+            "adjacency_mode": args.adjacency_mode,
+            "k_neighbors": args.k_neighbors,
+            "time_window": args.time_window,
+            "fairness_col": args.fairness_col,
+            "fairness_weight": args.fairness_weight,
+            "zip_fair_loss": float(stzi_model.loss_),
+        }
+        print("STZI-fair metrics:", stzi_metrics)
+
     leaderboard = cv_results.groupby("model")["rmse"].mean().sort_values()
     best_model_name = leaderboard.index[0]
     best_model = fitted_models[best_model_name]
@@ -410,6 +634,7 @@ def main() -> None:
                 "target": args.target,
                 "feature_cols": feature_cols,
                 "xgboost_available": XGBOOST_AVAILABLE,
+                "stzi_fair": stzi_metadata,
             },
             f,
             indent=2,
